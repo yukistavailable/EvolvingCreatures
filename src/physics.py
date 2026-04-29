@@ -4,6 +4,7 @@ import numpy as np
 
 GRAVITY = np.array([0.0, -9.81])
 DT = 1.0 / 60.0
+RESTITUTION = 0.5
 
 
 @dataclass
@@ -51,6 +52,11 @@ class Body:
         self.force = np.zeros(2)
         self.torque = 0.0
 
+    def velocity_at(self, world_point: np.ndarray) -> np.ndarray:
+        """Calculate the velocity at a specific world point."""
+        r = world_point - self.pos
+        return self.vel + self.angular_vel * np.array([-r[1], r[0]])
+
     def local_to_world(self, local_point: np.ndarray) -> np.ndarray:
         """Convert a point from local space to world space."""
         c = np.cos(self.angle)
@@ -71,3 +77,29 @@ class Body:
             ]
         )
         return np.array([self.local_to_world(corner) for corner in local_corners])
+
+
+def resolve_ground_collision(body: Body, ground_y: float):
+    """Simple collision response with the ground."""
+    corners = body.get_corners()
+    for corner in corners:
+        if corner[1] < ground_y:
+            penetration = ground_y - corner[1]
+            body.pos[1] += penetration
+            contact_vel = body.velocity_at(corner)
+
+            contact_vel_y = contact_vel[1]
+            if contact_vel_y > 0:
+                continue
+
+            r = corner - body.pos
+            # j = -(1 + e) * vn / (1/m + (r×n)² / I)
+            denominator = (1 / body.mass) + (
+                np.cross(r, np.array([0, 1])) ** 2
+            ) / body.inertia
+            if denominator == 0:
+                continue
+            j = -(1 + RESTITUTION) * contact_vel_y / denominator
+
+            body.vel[1] += j / body.mass
+            body.angular_vel += np.cross(r, np.array([0, j])) / body.inertia
