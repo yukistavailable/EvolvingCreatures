@@ -74,6 +74,7 @@ while running:
         f"vel: ({body.vel[0]:.2f}, {body.vel[1]:.2f})",
         f"angle: {np.degrees(body.angle):.1f} deg",
         f"angular_vel: {np.degrees(body.angular_vel):.1f} deg/s",
+        f"sleeping: {body.sleeping}",
         "",
         "[R] Reset  [ESC] Quit",
     ]

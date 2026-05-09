@@ -4,7 +4,11 @@ import numpy as np
 
 GRAVITY = np.array([0.0, -9.81])
 DT = 1.0 / 60.0
-RESTITUTION = 0.5
+RESTITUTION = 0.5  # coefficient of restitution
+FRICTION = 0.5  # coefficient of friction
+VELOCITY_THRESHOLD = 0.01  # threshold for considering a collision as resting contact
+SLEEP_LINEAR_THRESHOLD = 0.05
+SLEEP_ANGULAR_THRESHOLD = 0.1
 
 
 @dataclass
@@ -22,6 +26,7 @@ class Body:
 
     mass: float = 0.0
     inertia: float = 0.0
+    sleeping: bool = False
 
     def __post_init__(self):
         density = 1.0
@@ -40,6 +45,10 @@ class Body:
 
     def integrate(self, dt: float):
         """Semi-implicit Euler integration."""
+        if self.sleeping:
+            self.force = np.zeros(2)
+            self.torque = 0.0
+            return
 
         acc = self.force / self.mass + GRAVITY
         self.vel = self.vel + acc * dt
@@ -51,6 +60,12 @@ class Body:
 
         self.force = np.zeros(2)
         self.torque = 0.0
+
+        if self.vel is not None and np.linalg.norm(self.vel) < VELOCITY_THRESHOLD:
+            self.vel = np.zeros(2)
+
+        if abs(self.angular_vel) < VELOCITY_THRESHOLD:
+            self.angular_vel = 0.0
 
     def velocity_at(self, world_point: np.ndarray) -> np.ndarray:
         """Calculate the velocity at a specific world point."""
@@ -81,11 +96,27 @@ class Body:
 
 def resolve_ground_collision(body: Body, ground_y: float):
     """Simple collision response with the ground."""
+    if body.sleeping:
+        body.vel = np.zeros(2)
+        body.angular_vel = 0.0
+        body.force = np.zeros(2)
+        body.torque = 0.0
+        return
+
     corners = body.get_corners()
+    max_penetration = 0.0
     for corner in corners:
-        if corner[1] < ground_y:
-            penetration = ground_y - corner[1]
-            body.pos[1] += penetration
+        penetration = ground_y - corner[1]
+        if penetration > max_penetration:
+            max_penetration = penetration
+    if max_penetration > 0:
+        body.pos[1] += max_penetration
+
+    # Recalculate corners after position correction
+    corners = body.get_corners()
+
+    for corner in corners:
+        if corner[1] < ground_y + 0.01:
             contact_vel = body.velocity_at(corner)
 
             contact_vel_y = contact_vel[1]
@@ -99,7 +130,35 @@ def resolve_ground_collision(body: Body, ground_y: float):
             ) / body.inertia
             if denominator == 0:
                 continue
-            j = -(1 + RESTITUTION) * contact_vel_y / denominator
+            j: float = -(1 + RESTITUTION) * contact_vel_y / denominator
 
             body.vel[1] += j / body.mass
             body.angular_vel += np.cross(r, np.array([0, j])) / body.inertia
+
+            # Friction
+            contact_vel = body.velocity_at(corner)
+            contact_vel_x = contact_vel[0]
+
+            if abs(contact_vel_x) > VELOCITY_THRESHOLD:
+                denominator_friction = (1 / body.mass) + (
+                    np.cross(r, np.array([1, 0])) ** 2
+                ) / body.inertia
+                if denominator_friction == 0:
+                    continue
+                jt = -contact_vel_x / denominator_friction
+                max_friction = FRICTION * abs(j)
+                jt = np.clip(jt, -max_friction, max_friction)
+
+                body.vel[0] += jt / body.mass
+                body.angular_vel += np.cross(r, np.array([jt, 0])) / body.inertia
+
+    # Sleep check
+    on_ground = any(corner[1] <= ground_y + 0.01 for corner in corners)
+    if (
+        on_ground
+        and np.linalg.norm(body.vel) < SLEEP_LINEAR_THRESHOLD
+        and abs(body.angular_vel) < SLEEP_ANGULAR_THRESHOLD
+    ):
+        body.sleeping = True
+    else:
+        body.sleeping = False
