@@ -7,7 +7,7 @@ DT = 1.0 / 60.0
 RESTITUTION = 0.5  # coefficient of restitution
 FRICTION = 0.5  # coefficient of friction
 VELOCITY_THRESHOLD = 0.01  # threshold for considering a collision as resting contact
-SLEEP_LINEAR_THRESHOLD = 0.05
+SLEEP_LINEAR_THRESHOLD = 0.1
 SLEEP_ANGULAR_THRESHOLD = 0.1
 JOINT_ITERATIONS = 8
 
@@ -109,6 +109,8 @@ class RevoluteJoint:
     angle_min: float = None
     angle_max: float = None
 
+    sleeping: bool = False
+
     def get_world_anchor_a(self) -> np.ndarray:
         return self.body_a.local_to_world(self.anchor_a)
 
@@ -118,12 +120,24 @@ class RevoluteJoint:
     def get_angle(self) -> float:
         return self.body_b.angle - self.body_a.angle
 
+    def check_sleeping(self):
+        if self.body_a.sleeping or self.body_b.sleeping:
+            self.sleeping = True
+            self.body_a.sleeping = True
+            self.body_b.sleeping = True
+        else:
+            self.sleeping = False
+
 
 def solve_joint_constraint(joint: RevoluteJoint):
     """
     Solve the revolute joint constraint by applying corrective impulses to the connected bodies.
     Specifically, this function will ensure that the anchor points on both bodies coincide in world space and that the relative angle between the bodies stays within specified limits (if any).
     """
+    joint.check_sleeping()
+    if joint.sleeping:
+        return
+
     body_a = joint.body_a
     body_b = joint.body_b
 

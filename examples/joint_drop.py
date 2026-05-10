@@ -6,7 +6,7 @@ from src.physics import DT, Body, RevoluteJoint, resolve_ground_collision, solve
 WIDTH, HEIGHT = 800, 600
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Step 1-4: Revolute Joint")
+pygame.display.set_caption("Revolute Joint")
 clock = pygame.time.Clock()
 font = pygame.font.SysFont("monospace", 16)
 
@@ -106,9 +106,13 @@ while running:
     rel_angle = joint.get_angle()
     info_lines = [
         f"Body A pos: ({body_a.pos[0]:.2f}, {body_a.pos[1]:.2f})",
+        f"Body A vel: ({body_a.vel[0]:.2f}, {body_a.vel[1]:.2f})",
+        f"Body A angular vel: ({body_a.angular_vel:.2f})",
+        f"Body A sleeping: {body_a.sleeping}",
         f"Body B pos: ({body_b.pos[0]:.2f}, {body_b.pos[1]:.2f})",
-        f"BOdy A sleeping: {body_a.sleeping}",
-        f"BOdy B sleeping: {body_b.sleeping}",
+        f"Body B vel: ({body_b.vel[0]:.2f}, {body_b.vel[1]:.2f})",
+        f"Body B angular vel: ({body_b.angular_vel:.2f})",
+        f"Body B sleeping: {body_b.sleeping}",
         f"Joint angle: {np.degrees(rel_angle):.1f} deg",
         f"Angle limits: {'ON' if use_angle_limits else 'OFF'}",
         "",
