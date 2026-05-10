@@ -13,3 +13,9 @@ Drop Joints
 ```
 uv run python -m examples.drop_joint
 ```
+
+Drop Joints with a motor
+
+```
+uv run python -m examples.drop_joint_motor
+```

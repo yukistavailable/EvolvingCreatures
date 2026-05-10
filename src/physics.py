@@ -111,6 +111,9 @@ class RevoluteJoint:
 
     sleeping: bool = False
 
+    motor_torque: float = 0.0
+    max_motor_torque: float = 5.0
+
     def get_world_anchor_a(self) -> np.ndarray:
         return self.body_a.local_to_world(self.anchor_a)
 
@@ -140,6 +143,10 @@ def solve_joint_constraint(joint: RevoluteJoint):
 
     body_a = joint.body_a
     body_b = joint.body_b
+
+    torque = np.clip(joint.motor_torque, -1.0, 1.0) * joint.max_motor_torque
+    body_a.torque -= torque
+    body_b.torque += torque
 
     # Position constraint
     wa = joint.get_world_anchor_a()
