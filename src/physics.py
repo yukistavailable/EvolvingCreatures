@@ -4,11 +4,11 @@ import numpy as np
 
 GRAVITY = np.array([0.0, -9.81])
 DT = 1.0 / 60.0
-RESTITUTION = 0.3  # coefficient of restitution
+RESTITUTION = 0.4  # coefficient of restitution
 FRICTION = 0.5  # coefficient of friction
 VELOCITY_THRESHOLD = 0.01  # threshold for considering a collision as resting contact
-SLEEP_LINEAR_THRESHOLD = 0.1
-SLEEP_ANGULAR_THRESHOLD = 0.1
+SLEEP_LINEAR_THRESHOLD = 0.3
+SLEEP_ANGULAR_THRESHOLD = 0.3
 JOINT_ITERATIONS = 8
 PENETRATION_SLOP = 0.01
 BAUMGARTE_BETA = 0.3
@@ -288,7 +288,7 @@ class GroundContactConstraint:
 
         # Equation 20
         penetration_correction = max(self.penetration - PENETRATION_SLOP, 0.0)
-        self.bias = BAUMGARTE_BETA * penetration_correction
+        self.bias = (BAUMGARTE_BETA / dt) * penetration_correction
 
         # Equation 15
         v_contact = self.body.velocity_at(self.contact_point)
@@ -340,63 +340,58 @@ def solve_ground_contact_constraints(
         return
 
     body = constraints[0].body
-    k = len(constraints)
 
-    inv_mass = 1.0 / body.mass if body.mass > 0 else 0
-    inv_inertia = 1.0 / body.inertia if body.inertia > 0 else 0
+    for c in constraints:
+        c.precompute(dt)
 
-    M_inv = np.diag([inv_mass, inv_mass, inv_inertia])
+    # PGS iterations
+    for _ in range(CONTACT_ITERATIONS):
+        for c in constraints:
+            n = np.array([0.0, 1.0])
+            t = np.array([1.0, 0.0])
 
-    # Build Jacobian
-    # J is a (2k × 3) matrix, where each contact contributes 2 rows (normal and friction).
-    # Because we have only one body, and the ground is static, we only have columns for the body's velocity (vx, vy, ω).
-    J = np.zeros((2 * k, 3))
-    b = np.zeros(2 * k)
+            # Current velocity at contact point
+            v_contact = body.velocity_at(c.contact_point)
 
-    for i, constraint in enumerate(constraints):
-        constraint.precompute(dt)
+            # Normal constraint
+            v_n = np.dot(v_contact, n)
+            # Δλ = -(J·V + bias) / (J·M⁻¹·Jᵀ)
+            # target: v_n = bias  →  Δλ = -(v_n - bias) / mass_n
+            delta_lambda_n = -(v_n - c.bias) / c.mass_n
 
-        r_cross_n = np.cross(constraint.r, np.array([0, 1]))  # rᵢ × n
-        r_cross_t = np.cross(constraint.r, np.array([1, 0]))
+            # Accumulate and clamp: λ_n ≥ 0
+            old_lambda_n = c.lambda_n
+            c.lambda_n = max(0.0, c.lambda_n + delta_lambda_n)
+            impulse_n = (c.lambda_n - old_lambda_n) * n
 
-        J[2 * i] = [0, 1, r_cross_n]  # Normal row
-        J[2 * i + 1] = [1, 0, r_cross_t]  # Friction row
+            # Apply normal impulse to body
+            body.vel += impulse_n / body.mass
+            body.angular_vel += np.cross(c.r, impulse_n) / body.inertia
 
-        b[2 * i] = constraint.bias / dt  # Normal bias
-        b[2 * i + 1] = 0.0  # Friction has no bias
+            # Friction constraint
+            # Recompute contact velocity after normal impulse
+            v_contact = body.velocity_at(c.contact_point)
+            v_t = np.dot(v_contact, t)
 
-    # Solve for λ
-    A = J @ M_inv @ J.T
-    V_star = np.array([body.vel[0], body.vel[1], body.angular_vel])
-    b -= J @ V_star / dt
+            delta_lambda_t = -v_t / c.mass_t
 
-    lambda_solution = np.linalg.solve(A, b)
+            # Accumulate and clamp: |λ_t| ≤ μ * λ_n
+            old_lambda_t = c.lambda_t
+            max_friction = FRICTION * c.lambda_n
+            c.lambda_t = np.clip(
+                c.lambda_t + delta_lambda_t, -max_friction, max_friction
+            )
+            impulse_t = (c.lambda_t - old_lambda_t) * t
 
-    # Clamp friction impulses
-    for i in range(k):
-        lambda_n = lambda_solution[2 * i]
-        lambda_solution[2 * i] = max(0.0, lambda_n)
-        lambda_t = lambda_solution[2 * i + 1]
-
-        max_friction = FRICTION * abs(lambda_n)
-        lambda_t = np.clip(lambda_t, -max_friction, max_friction)
-
-        lambda_solution[2 * i + 1] = lambda_t
-
-    V_new = V_star + M_inv @ J.T @ lambda_solution * dt
-    body.vel[0] = V_new[0]
-    body.vel[1] = V_new[1]
-    body.angular_vel = V_new[2]
-
-    for i, c in enumerate(constraints):
-        c.lambda_n = lambda_solution[2 * i]
-        c.lambda_t = lambda_solution[2 * i + 1]
+            # Apply friction impulse to body
+            body.vel += impulse_t / body.mass
+            body.angular_vel += np.cross(c.r, impulse_t) / body.inertia
 
 
 def check_sleeping(body: Body, ground_y: float):
     """Check if the body should go to sleep."""
     corners = body.get_corners()
-    on_ground = any(corner[1] <= ground_y + 0.01 for corner in corners)
+    on_ground = any(corner[1] <= ground_y + PENETRATION_SLOP for corner in corners)
     if (
         on_ground
         and np.linalg.norm(body.vel) < SLEEP_LINEAR_THRESHOLD
@@ -435,7 +430,7 @@ def resolve_ground_collision(body: Body, ground_y: float):
     corners = body.get_corners()
 
     for corner in corners:
-        if corner[1] < ground_y + 0.01:
+        if corner[1] < ground_y + PENETRATION_SLOP:
             contact_vel = body.velocity_at(corner)
 
             contact_vel_y = contact_vel[1]
@@ -472,7 +467,7 @@ def resolve_ground_collision(body: Body, ground_y: float):
                 body.angular_vel += np.cross(r, np.array([jt, 0])) / body.inertia
 
     # Sleep check
-    on_ground = any(corner[1] <= ground_y + 0.01 for corner in corners)
+    on_ground = any(corner[1] <= ground_y + PENETRATION_SLOP for corner in corners)
     if (
         on_ground
         and np.linalg.norm(body.vel) < SLEEP_LINEAR_THRESHOLD
