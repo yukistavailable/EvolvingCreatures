@@ -357,6 +357,99 @@ def solve_joints(
             joint.solve_point_constraint()
             joint.solve_angle_constraint()
 
+def step_world(
+    bodies: list[Body],
+    joints: list["RevoluteJoint"],
+    ground_y: float,
+    dt: float = DT,
+    iterations: int = max(JOINT_ITERATIONS, CONTACT_ITERATIONS),
+    allow_sleeping: bool = False,
+) -> list["GroundContactConstraint"]:
+    """Advance an entire multi-body world by one time step.
+
+    This is the single entry point for simulating a creature (root body plus
+    its jointed parts) sitting on the ground. It folds together three things
+    that the two-body drop_joint.py demo handled manually and separately:
+
+    1. Sleeping is OFF by default. An actuated creature that momentarily slows
+    down must NOT be put to sleep, or its motors stop being applied and it
+    freezes mid-stride. Pass allow_sleeping=True only for passive scenes.
+
+    2. Joints and ground contacts are solved in ONE interleaved PGS loop, so
+    the foot-vs-ground reaction and the joint chain see each other every
+    iteration. Solving them in separate passes (joints fully, then contacts
+    fully) lets joints drift and feet sink on articulated bodies.
+
+    3. All bodies, all joints, and all contacts are stepped together, instead
+    of integrating two named bodies by hand.
+
+    Step order (semi-implicit Euler with a velocity-level constraint solve):
+        integrate velocities -> generate + precompute constraints
+        -> interleaved PGS -> integrate positions.
+
+    Returns the contact constraints generated this step (handy for rendering
+    or for contact sensors).
+    """
+    # Sleeping management
+    if not allow_sleeping:
+        for b in bodies:
+            b.sleeping = False
+        for j in joints:
+            j.sleeping = False
+
+    # Integrate velocities (gravity + any accumulated forces)
+    for b in bodies:
+        b.integrate_velocity(dt)
+
+    # Generate ground contact constraints for every body
+    contacts: list[GroundContactConstraint] = []
+    for b in bodies:
+        if b.sleeping:
+            continue
+        contacts.extend(generate_ground_contact_constraints(b, ground_y))
+
+    # Precompute joints (+ apply motors) and contacts
+    active_joints: list[RevoluteJoint] = []
+    for j in joints:
+        if allow_sleeping:
+            j.check_sleeping()
+        if j.sleeping:
+            continue
+        j.precompute(dt)
+
+        # Motor torque is applied once, before the solve, as a direct angular
+        # velocity change on the two connected bodies (same scheme as
+        # solve_joints). This is where the brain's effector output enters.
+        if j.motor_torque != 0.0:
+            torque = np.clip(j.motor_torque, -1.0, 1.0) * j.max_motor_torque
+            motor_impulse = torque * dt
+            j.body_a.angular_vel -= motor_impulse / j.body_a.inertia
+            j.body_b.angular_vel += motor_impulse / j.body_b.inertia
+
+        active_joints.append(j)
+
+    for c in contacts:
+        c.precompute(dt)
+
+    # Interleaved velocity solve (joint <-> contact coupling)
+    for _ in range(iterations):
+        for j in active_joints:
+            j.solve_point_constraint()
+            j.solve_angle_constraint()
+        for c in contacts:
+            c.solve_velocity()
+
+    # Integrate positions using the corrected velocities
+    for b in bodies:
+        b.integrate_position(dt)
+
+    # Optional sleeping (passive scenes only)
+    if allow_sleeping:
+        for b in bodies:
+            check_sleeping(b, ground_y)
+
+    return contacts
+
 
 @dataclass
 class GroundContactConstraint:
@@ -401,6 +494,46 @@ class GroundContactConstraint:
         if v_n < -VELOCITY_THRESHOLD:
             self.bias += -RESTITUTION * v_n
 
+    def solve_velocity(self):
+        """Solve this contact (normal + friction) — one PGS step.
+
+        Extracted from the inner loop of solve_ground_contact_constraints so
+        the same single step can be interleaved with joint solving inside
+        step_world. Assumes precompute() has already been called this frame.
+        """
+        body = self.body
+        n = np.array([0.0, 1.0])  # Ground normal
+        t = np.array([1.0, 0.0])  # Ground tangent
+
+        # Normal constraint (non-penetration): λ_n ≥ 0
+        v_contact = body.velocity_at(self.contact_point)
+        v_n = np.dot(v_contact, n)
+        # target: v_n = bias  →  Δλ = -(v_n - bias) / mass_n
+        delta_lambda_n = -(v_n - self.bias) / self.mass_n
+
+        old_lambda_n = self.lambda_n
+        self.lambda_n = max(0.0, self.lambda_n + delta_lambda_n)
+        impulse_n = (self.lambda_n - old_lambda_n) * n
+
+        body.vel += impulse_n / body.mass
+        body.angular_vel += np.cross(self.r, impulse_n) / body.inertia
+
+        # Friction constraint: |λ_t| ≤ μ λ_n
+        # Recompute contact velocity after the normal impulse.
+        v_contact = body.velocity_at(self.contact_point)
+        v_t = np.dot(v_contact, t)
+        delta_lambda_t = -v_t / self.mass_t
+
+        old_lambda_t = self.lambda_t
+        max_friction = FRICTION * self.lambda_n
+        self.lambda_t = np.clip(
+            self.lambda_t + delta_lambda_t, -max_friction, max_friction
+        )
+        impulse_t = (self.lambda_t - old_lambda_t) * t
+
+        body.vel += impulse_t / body.mass
+        body.angular_vel += np.cross(self.r, impulse_t) / body.inertia
+
 
 def generate_ground_contact_constraints(
     body: Body, ground_y: float
@@ -444,53 +577,13 @@ def solve_ground_contact_constraints(
     if not constraints:
         return
 
-    body = constraints[0].body
-
     for c in constraints:
         c.precompute(dt)
 
     # PGS iterations
     for _ in range(CONTACT_ITERATIONS):
         for c in constraints:
-            n = np.array([0.0, 1.0])
-            t = np.array([1.0, 0.0])
-
-            # Current velocity at contact point
-            v_contact = body.velocity_at(c.contact_point)
-
-            # Normal constraint
-            v_n = np.dot(v_contact, n)
-            # Δλ = -(J·V + bias) / (J·M⁻¹·Jᵀ)
-            # target: v_n = bias  →  Δλ = -(v_n - bias) / mass_n
-            delta_lambda_n = -(v_n - c.bias) / c.mass_n
-
-            # Accumulate and clamp: λ_n ≥ 0
-            old_lambda_n = c.lambda_n
-            c.lambda_n = max(0.0, c.lambda_n + delta_lambda_n)
-            impulse_n = (c.lambda_n - old_lambda_n) * n
-
-            # Apply normal impulse to body
-            body.vel += impulse_n / body.mass
-            body.angular_vel += np.cross(c.r, impulse_n) / body.inertia
-
-            # Friction constraint
-            # Recompute contact velocity after normal impulse
-            v_contact = body.velocity_at(c.contact_point)
-            v_t = np.dot(v_contact, t)
-
-            delta_lambda_t = -v_t / c.mass_t
-
-            # Accumulate and clamp: |λ_t| ≤ μ * λ_n
-            old_lambda_t = c.lambda_t
-            max_friction = FRICTION * c.lambda_n
-            c.lambda_t = np.clip(
-                c.lambda_t + delta_lambda_t, -max_friction, max_friction
-            )
-            impulse_t = (c.lambda_t - old_lambda_t) * t
-
-            # Apply friction impulse to body
-            body.vel += impulse_t / body.mass
-            body.angular_vel += np.cross(c.r, impulse_t) / body.inertia
+            c.solve_velocity()
 
 
 def check_sleeping(body: Body, ground_y: float):
