@@ -7,8 +7,8 @@ DT = 1.0 / 60.0
 RESTITUTION = 0.4  # coefficient of restitution
 FRICTION = 0.5  # coefficient of friction
 VELOCITY_THRESHOLD = 0.01  # threshold for considering a collision as resting contact
-SLEEP_LINEAR_THRESHOLD = 0.3
-SLEEP_ANGULAR_THRESHOLD = 0.3
+SLEEP_LINEAR_THRESHOLD = 0.2
+SLEEP_ANGULAR_THRESHOLD = 0.2
 JOINT_ITERATIONS = 8
 PENETRATION_SLOP = 0.01
 BAUMGARTE_BETA = 0.3
@@ -137,6 +137,18 @@ class RevoluteJoint:
     motor_torque: float = 0.0
     max_motor_torque: float = 5.0
 
+    lambda_point: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    lambda_angle: float = 0.0
+
+    # Precomputed values
+    _ra: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    _rb: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    _K: np.ndarray = field(default_factory=lambda: np.zeros((2, 2)))
+    _K_inv: np.ndarray = field(default_factory=lambda: np.zeros((2, 2)))
+    _bias_point: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    _mass_angle: float = 0.0
+    _bias_angle: float = 0.0
+
     def get_world_anchor_a(self) -> np.ndarray:
         return self.body_a.local_to_world(self.anchor_a)
 
@@ -147,110 +159,203 @@ class RevoluteJoint:
         return self.body_b.angle - self.body_a.angle
 
     def check_sleeping(self):
-        if self.body_a.sleeping or self.body_b.sleeping:
+        a_can_sleep = (
+            np.linalg.norm(self.body_a.vel) < SLEEP_LINEAR_THRESHOLD
+            and abs(self.body_a.angular_vel) < SLEEP_ANGULAR_THRESHOLD
+        )
+        b_can_sleep = (
+            np.linalg.norm(self.body_b.vel) < SLEEP_LINEAR_THRESHOLD
+            and abs(self.body_b.angular_vel) < SLEEP_ANGULAR_THRESHOLD
+        )
+
+        if a_can_sleep and b_can_sleep:
             self.sleeping = True
             self.body_a.sleeping = True
             self.body_b.sleeping = True
         else:
             self.sleeping = False
+            self.body_a.sleeping = False
+            self.body_b.sleeping = False
 
+    def precompute(self, dt: float):
+        """Precompute effective mass and bias for PGS iterations.
 
-def solve_joint_constraint(joint: RevoluteJoint):
-    """
-    Solve the revolute joint constraint by applying corrective impulses to the connected bodies.
-    Specifically, this function will ensure that the anchor points on both bodies coincide in world space and that the relative angle between the bodies stays within specified limits (if any).
-    """
-    joint.check_sleeping()
-    if joint.sleeping:
-        return
+        Called once per time step before the PGS loop begins.
+        """
+        # Reset accumulated impulses for this time step
+        self.lambda_point = np.zeros(2)
+        self.lambda_angle = 0.0
 
-    body_a = joint.body_a
-    body_b = joint.body_b
+        body_a = self.body_a
+        body_b = self.body_b
 
-    torque = np.clip(joint.motor_torque, -1.0, 1.0) * joint.max_motor_torque
-    body_a.torque -= torque
-    body_b.torque += torque
+        wa = self.get_world_anchor_a()
+        wb = self.get_world_anchor_b()
 
-    # Position constraint
-    wa = joint.get_world_anchor_a()
-    wb = joint.get_world_anchor_b()
-    delta = wb - wa
-    distance = np.linalg.norm(delta)
-    if distance < 1e-6:
-        pass
-    else:
-        inv_mass_a = 1 / body_a.mass if body_a.mass > 0 else 0
-        inv_mass_b = 1 / body_b.mass if body_b.mass > 0 else 0
+        self._ra = wa - body_a.pos
+        self._rb = wb - body_b.pos
+        ra = self._ra
+        rb = self._rb
 
-        # Baumgarte stabilization
-        # See https://box2d.org/posts/2024/02/solver2d/#:~:text=normal)%20%2B%20originalSeparation%3B-,Baumgarte%20Stabilization,-Baumgarte%20Stabilization%20comes
-        beta = 0.3
-        correction = delta * beta
+        inv_ma = 1.0 / body_a.mass
+        inv_mb = 1.0 / body_b.mass
+        inv_Ia = 1.0 / body_a.inertia
+        inv_Ib = 1.0 / body_b.inertia
 
-        body_a.pos += correction * inv_mass_a / (inv_mass_a + inv_mass_b)
-        body_b.pos -= correction * inv_mass_b / (inv_mass_a + inv_mass_b)
-
-    # Velocity constraint
-    wa = joint.get_world_anchor_a()
-    wb = joint.get_world_anchor_b()
-
-    ra = wa - body_a.pos
-    rb = wb - body_b.pos
-
-    vel_a = body_a.velocity_at(wa)
-    vel_b = body_b.velocity_at(wb)
-    relative_vel = vel_b - vel_a
-
-    if np.linalg.norm(relative_vel) < VELOCITY_THRESHOLD:
-        pass
-    else:
-        # Compute the impulse to make the relative velocity zero at the constraint point.
-        inv_mass_a = 1 / body_a.mass if body_a.mass > 0 else 0
-        inv_mass_b = 1 / body_b.mass if body_b.mass > 0 else 0
-
-        # K * impulse = -relative_vel
-        # K[0][0] = 1/ma + 1/mb + ra_y^2/Ia + rb_y^2/Ib
-        # K[0][1] = -ra_x*ra_y/Ia - rb_x*rb_y/Ib
-        # K[1][0] = K[0][1]
-        # K[1][1] = 1/ma + 1/mb + ra_x^2/Ia + rb_x^2/Ib
-        K = np.array(
+        # --- Point constraint effective mass (2×2) ---
+        # K = J M⁻¹ Jᵀ, expanded for 2D revolute joint:
+        #   K[0][0] = 1/ma + 1/mb + ra_y²/Ia + rb_y²/Ib
+        #   K[0][1] = -ra_x*ra_y/Ia - rb_x*rb_y/Ib
+        #   K[1][0] = K[0][1]
+        #   K[1][1] = 1/ma + 1/mb + ra_x²/Ia + rb_x²/Ib
+        self._K = np.array(
             [
                 [
-                    inv_mass_a
-                    + inv_mass_b
-                    + ra[1] ** 2 / body_a.inertia
-                    + rb[1] ** 2 / body_b.inertia,
-                    -ra[0] * ra[1] / body_a.inertia - rb[0] * rb[1] / body_b.inertia,
+                    inv_ma + inv_mb + ra[1] ** 2 * inv_Ia + rb[1] ** 2 * inv_Ib,
+                    -ra[0] * ra[1] * inv_Ia - rb[0] * rb[1] * inv_Ib,
                 ],
                 [
-                    -ra[0] * ra[1] / body_a.inertia - rb[0] * rb[1] / body_b.inertia,
-                    inv_mass_a
-                    + inv_mass_b
-                    + ra[0] ** 2 / body_a.inertia
-                    + rb[0] ** 2 / body_b.inertia,
+                    -ra[0] * ra[1] * inv_Ia - rb[0] * rb[1] * inv_Ib,
+                    inv_ma + inv_mb + ra[0] ** 2 * inv_Ia + rb[0] ** 2 * inv_Ib,
                 ],
             ]
         )
+        self._K_inv = np.linalg.inv(self._K)
 
-        impulse = np.linalg.solve(K, -relative_vel)
-        body_a.vel -= impulse * inv_mass_a
-        body_a.angular_vel -= np.cross(ra, impulse) / body_a.inertia
-        body_b.vel += impulse * inv_mass_b
-        body_b.angular_vel += np.cross(rb, impulse) / body_b.inertia
+        # Baumgarte bias for position drift
+        # Paper Eq. 20: JV = -βC, where C = wb - wa (position error)
+        # We want Cdot to drive bodies back together: bias = -(β/dt) * C
+        position_error = wb - wa  # C = x_b + r_b - x_a - r_a
+        self._bias_point = -(BAUMGARTE_BETA / dt) * position_error
 
-    # Angle limits
-    if joint.angle_min is not None and joint.angle_max is not None:
-        relative_angle = joint.get_angle()
-        total_inv_i = 1.0 / body_a.inertia + 1.0 / body_b.inertia
+        # Angle limit effective mass (scalar)
+        # For relative angle constraint, J = [0, 0, -1, 0, 0, +1]
+        # So J M⁻¹ Jᵀ = 1/Ia + 1/Ib
+        self._mass_angle = inv_Ia + inv_Ib
 
-        if relative_angle < joint.angle_min:
-            diff = joint.angle_min - relative_angle
-            body_a.angle -= diff * (1.0 / body_a.inertia) / total_inv_i * 0.5
-            body_b.angle += diff * (1.0 / body_b.inertia) / total_inv_i * 0.5
-        elif relative_angle > joint.angle_max:
-            diff = relative_angle - joint.angle_max
-            body_a.angle += diff * (1.0 / body_a.inertia) / total_inv_i * 0.5
-            body_b.angle -= diff * (1.0 / body_b.inertia) / total_inv_i * 0.5
+        # Angle limit bias: drive angle back within limits
+        self._bias_angle = 0.0
+        if self.angle_min is not None and self.angle_max is not None:
+            relative_angle = self.get_angle()
+            if relative_angle < self.angle_min:
+                # C = relative_angle - angle_min < 0, want to push angle up
+                self._bias_angle = -(BAUMGARTE_BETA / dt) * (
+                    relative_angle - self.angle_min
+                )
+            elif relative_angle > self.angle_max:
+                # C = relative_angle - angle_max > 0, want to push angle down
+                self._bias_angle = -(BAUMGARTE_BETA / dt) * (
+                    relative_angle - self.angle_max
+                )
+
+    def solve_point_constraint(self):
+        """Solve the 2D point constraint (anchor coincidence) — one PGS step.
+
+        Velocity constraint: Ċ = v_b + ω_b × r_b - v_a - ω_a × r_a = -bias
+        """
+        body_a = self.body_a
+        body_b = self.body_b
+        ra = self._ra
+        rb = self._rb
+
+        # Relative velocity at anchor: v_b + ω_b × r_b - v_a - ω_a × r_a
+        vel_a = body_a.velocity_at(body_a.pos + ra)
+        vel_b = body_b.velocity_at(body_b.pos + rb)
+        Cdot = vel_b - vel_a
+
+        # Δλ = K⁻¹ * -(Ċ - bias)
+        delta_lambda = self._K_inv @ -(Cdot - self._bias_point)
+
+        # Point constraint is equality: λ ∈ (-∞, +∞), no clamping needed
+        self.lambda_point += delta_lambda
+
+        # Apply impulse
+        inv_ma = 1.0 / body_a.mass
+        inv_mb = 1.0 / body_b.mass
+
+        body_a.vel -= delta_lambda * inv_ma
+        body_a.angular_vel -= np.cross(ra, delta_lambda) / body_a.inertia
+
+        body_b.vel += delta_lambda * inv_mb
+        body_b.angular_vel += np.cross(rb, delta_lambda) / body_b.inertia
+
+    def solve_angle_constraint(self):
+        """Solve the angle limit constraint — one PGS step.
+
+        This is an inequality constraint on the relative angle.
+        The constraint is: angle_min ≤ θ_b - θ_a ≤ angle_max
+
+        We split this into two one-sided constraints:
+            - Lower limit: C_lo = θ_rel - angle_min ≥ 0  →  λ_lo ≥ 0
+            - Upper limit: C_hi = angle_max - θ_rel ≥ 0  →  λ_hi ≥ 0
+
+        Combined as a single λ with bounds:
+            If below min: λ ≥ 0 (push angle up)
+            If above max: λ ≤ 0 (push angle down)
+            If within range: no constraint active
+        """
+        if self.angle_min is None or self.angle_max is None:
+            return
+        if self._bias_angle == 0.0:
+            # Within limits, no constraint active
+            self.lambda_angle = 0.0
+            return
+
+        body_a = self.body_a
+        body_b = self.body_b
+
+        # Relative angular velocity: ω_b - ω_a
+        Cdot_angle = body_b.angular_vel - body_a.angular_vel
+
+        delta_lambda = -(Cdot_angle - self._bias_angle) / self._mass_angle
+
+        old_lambda = self.lambda_angle
+        self.lambda_angle += delta_lambda
+
+        # Clamp based on which limit is violated
+        relative_angle = self.get_angle()
+        if relative_angle < self.angle_min:
+            # Need positive torque to push angle up: λ ≥ 0
+            self.lambda_angle = max(0.0, self.lambda_angle)
+        elif relative_angle > self.angle_max:
+            # Need negative torque to push angle down: λ ≤ 0
+            self.lambda_angle = min(0.0, self.lambda_angle)
+
+        actual_delta = self.lambda_angle - old_lambda
+
+        # J = [0, 0, -1, 0, 0, +1] → impulse on angular velocity only
+        body_a.angular_vel -= actual_delta / body_a.inertia
+        body_b.angular_vel += actual_delta / body_b.inertia
+
+
+def solve_joints(
+    joints: list[RevoluteJoint], dt: float, iterations: int = JOINT_ITERATIONS
+):
+    """
+    Solve all joint constraints using PGS.
+    """
+    # Precompute all joints
+    for joint in joints:
+        joint.check_sleeping()
+        if joint.sleeping:
+            continue
+        joint.precompute(dt)
+
+        # Apply motor torque as external impulse (before constraint solve)
+        if joint.motor_torque != 0.0:
+            torque = np.clip(joint.motor_torque, -1.0, 1.0) * joint.max_motor_torque
+            # Apply as angular velocity change (impulse / inertia)
+            motor_impulse = torque * dt
+            joint.body_a.angular_vel -= motor_impulse / joint.body_a.inertia
+            joint.body_b.angular_vel += motor_impulse / joint.body_b.inertia
+
+    # PGS iterations
+    for _ in range(iterations):
+        for joint in joints:
+            if joint.sleeping:
+                continue
+            joint.solve_point_constraint()
+            joint.solve_angle_constraint()
 
 
 @dataclass
@@ -400,12 +505,6 @@ def check_sleeping(body: Body, ground_y: float):
         body.sleeping = True
     else:
         body.sleeping = False
-
-
-def solve_joints(joints: list[RevoluteJoint], iterations: int = JOINT_ITERATIONS):
-    for _ in range(iterations):
-        for joint in joints:
-            solve_joint_constraint(joint)
 
 
 def resolve_ground_collision(body: Body, ground_y: float):
